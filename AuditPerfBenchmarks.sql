@@ -1746,4 +1746,173 @@ GO
 EXEC History.up_Track_Temporal_Benchmark;
 GO
 
+EXECUTE sys.sp_cdc_enable_db;
+go
 
+IF OBJECT_ID('[dbo].[Track_CDC]') IS NOT NULL
+	DROP TABLE [dbo].[Track_CDC]
+GO
+
+CREATE TABLE [dbo].[Track_CDC](
+	[PersonID] [int] IDENTITY(1,1) NOT NULL PRIMARY KEY,
+	[FullName] [nvarchar](100) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+	[Username] [varchar](100) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+	[IsActive] [bit] NOT NULL,
+	[Birthday] [date] NULL,
+	[Age]  AS (DATEDIFF(year,[Birthday],GETDATE())),
+	[LastUpdatedDate] [datetime2](7) NOT NULL,
+	[LastUpdatedBy] [varchar](50) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL
+) ON [PRIMARY]
+GO
+
+EXEC sys.sp_cdc_enable_table
+@source_schema = N'dbo',
+@source_name   = N'Track_CDC',
+@role_name     = NULL,
+@supports_net_changes = 1
+GO
+
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+IF OBJECT_ID('History.up_Track_CDC_Benchmark') IS NOT NULL
+	DROP PROC History.up_Track_CDC_Benchmark
+GO
+
+CREATE PROC History.up_Track_CDC_Benchmark
+AS
+BEGIN
+SET NOCOUNT ON;
+
+DECLARE @start datetime2;
+DECLARE @cnt int;
+SET @cnt = 1;
+
+WHILE @cnt <= 100000
+BEGIN
+	INSERT [dbo].[Track_CDC] (
+		[FullName]
+		, [Username]
+		, [IsActive]
+		, [Birthday]
+		, [LastUpdatedDate]
+		, [LastUpdatedBy] )
+	VALUES (
+		'P' + STR(@cnt)
+		, 'U' + STR(@cnt)
+		, 1
+		, DATEADD(dd, (@cnt % 2000), '1/1/1960')
+		, GETUTCDATE()
+		, 'inserter' )
+
+	SET @cnt = @cnt + 1;	
+END
+
+SET @cnt = 1;
+SET @start = SYSDATETIME();
+
+WHILE @cnt <= 20000
+BEGIN
+	INSERT [dbo].[Track_CDC] (
+		[FullName]
+		, [Username]
+		, [IsActive]
+		, [Birthday]
+		, [LastUpdatedDate]
+		, [LastUpdatedBy] )
+	VALUES (
+		'P' + STR(@cnt + 100000)
+		, 'U' + STR(@cnt + 100000)
+		, 1
+		, DATEADD(dd, (@cnt % 2000), '1/1/1960')
+		, GETUTCDATE()
+		, 'inserter' )
+
+	SET @cnt = @cnt + 1;	
+END
+
+PRINT 'CDC insert: ' + STR(DATEDIFF(ms, @start, SYSDATETIME()))
+
+SET @cnt = 1;
+SET @start = SYSDATETIME();
+
+WHILE @cnt <= 6000
+BEGIN
+	UPDATE t
+	SET
+		IsActive = 0, LastUpdatedBy = 'updater', LastUpdatedDate = SYSDATETIME()
+	FROM dbo.Track_CDC t
+	WHERE t.PersonID = @cnt + 100000;
+
+	SET @cnt = @cnt + 1;	
+END
+
+WHILE @cnt <= 12000
+BEGIN
+	UPDATE t
+	SET
+		Birthday = DATEADD(yyyy, 1, Birthday), LastUpdatedBy = 'updater', LastUpdatedDate = SYSDATETIME()
+	FROM dbo.Track_CDC t
+	WHERE t.PersonID = @cnt + 100000;
+
+	SET @cnt = @cnt + 1;	
+END
+
+PRINT 'CDC update: ' + STR(DATEDIFF(ms, @start, SYSDATETIME()))
+
+SET @cnt = 1;
+SET @start = SYSDATETIME();
+
+WHILE @cnt <= 12000
+BEGIN
+	DELETE t
+	FROM dbo.Track_CDC t
+	WHERE t.PersonID = @cnt + 104000;
+
+	SET @cnt = @cnt + 1;	
+END
+
+PRINT 'CDC delete: ' + STR(DATEDIFF(ms, @start, SYSDATETIME()))
+
+DECLARE @result bigint;
+SET @start = SYSDATETIME();
+SET @cnt = 1
+SET @result = 0;
+
+WHILE @cnt <= 20
+BEGIN
+	SELECT @result = @result + SUM(h1.PersonID)
+	FROM cdc.dbo_track_cdc_ct h1
+		JOIN cdc.dbo_track_cdc_ct h2
+			ON h1.PersonID = h2.PersonID
+	WHERE h2.LastUpdatedDate =
+		(SELECT MIN(h3.LastUpdatedDate)
+		FROM cdc.dbo_track_cdc_ct h3
+		WHERE h3.PersonID = h1.PersonID
+		AND h3.LastUpdatedDate > h1.LastUpdatedDate)
+	AND h2.__$operation not in (1, 3)
+	AND h1.__$operation not in (1, 3)
+	AND h2.Birthday <> h1.Birthday;
+	
+	SET @cnt = @cnt + 1;
+END
+
+IF @result <> 13080060000
+	RAISERROR('Assert failed: incorrect query data.', 16, 1);
+
+PRINT 'Counting birthdate changes: ' + STR(DATEDIFF(ms, @start, SYSDATETIME()))
+
+END
+GO
+
+EXEC History.up_Track_CDC_Benchmark
+GO
+
+EXEC sys.sp_cdc_disable_table
+@source_schema = N'dbo',
+@source_name   = N'Track_CDC',
+@capture_instance = 'dbo_Track_CDC'
+GO
